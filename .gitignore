@@ -1,0 +1,22 @@
+node_modules/
+dist/
+*.js.map
+.DS_Store
+
+# SAM model (2.4GB - users download separately)
+models/
+*.pth
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# IDE
+.idea/
+.vscode/
+
+# Figma plugin build output
+figma-plugin/code.js
+figma-plugin/node_modules/

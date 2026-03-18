@@ -1,0 +1,11 @@
+{
+  "name": "SAM Layer Importer",
+  "id": "sam-layer-importer",
+  "api": "1.0.0",
+  "main": "code.js",
+  "ui": "ui.html",
+  "editorType": ["figma"],
+  "networkAccess": {
+    "allowedDomains": ["none"]
+  }
+}

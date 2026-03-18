@@ -1,0 +1,39 @@
+{
+  "name": "sam-figma-layer",
+  "version": "1.0.0",
+  "description": "Segment Anything Model (SAM) image segmentation + Figma layer placement. MCP server for Claude Code/Desktop.",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "sam-figma-layer": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx watch src/index.ts",
+    "start": "node dist/index.js",
+    "setup": "python3 scripts/install_sam.py"
+  },
+  "keywords": [
+    "mcp",
+    "claude-code",
+    "figma",
+    "segment-anything",
+    "image-segmentation",
+    "layer-separation"
+  ],
+  "author": "Fu",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/fujikento/sam-figma-layer.git"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.4",
+    "sharp": "^0.33.2"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.19",
+    "tsx": "^4.7.1",
+    "typescript": "^5.3.3"
+  }
+}

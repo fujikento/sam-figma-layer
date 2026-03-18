@@ -1,0 +1,278 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    body {
+      font-family: Inter, -apple-system, BlinkMacSystemFont, sans-serif;
+      font-size: 13px;
+      color: #333;
+      padding: 16px;
+      background: #fff;
+    }
+
+    h2 {
+      font-size: 15px;
+      font-weight: 600;
+      margin-bottom: 4px;
+    }
+
+    .subtitle {
+      color: #999;
+      font-size: 12px;
+      margin-bottom: 16px;
+    }
+
+    .step {
+      margin-bottom: 16px;
+    }
+
+    .step-label {
+      font-weight: 600;
+      font-size: 12px;
+      color: #666;
+      margin-bottom: 6px;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+
+    textarea {
+      width: 100%;
+      height: 120px;
+      border: 1px solid #ddd;
+      border-radius: 6px;
+      padding: 10px;
+      font-family: 'SF Mono', 'Fira Code', monospace;
+      font-size: 11px;
+      resize: vertical;
+      outline: none;
+      transition: border-color 0.2s;
+    }
+
+    textarea:focus {
+      border-color: #18A0FB;
+    }
+
+    .drop-zone {
+      border: 2px dashed #ddd;
+      border-radius: 8px;
+      padding: 24px;
+      text-align: center;
+      cursor: pointer;
+      transition: all 0.2s;
+      background: #fafafa;
+    }
+
+    .drop-zone:hover, .drop-zone.dragover {
+      border-color: #18A0FB;
+      background: #f0f8ff;
+    }
+
+    .drop-zone p {
+      color: #999;
+      font-size: 12px;
+    }
+
+    .drop-zone .icon {
+      font-size: 28px;
+      margin-bottom: 8px;
+      display: block;
+    }
+
+    .file-input {
+      display: none;
+    }
+
+    .file-list {
+      margin-top: 8px;
+      font-size: 11px;
+      color: #666;
+      max-height: 80px;
+      overflow-y: auto;
+    }
+
+    .file-list .file-item {
+      padding: 2px 0;
+    }
+
+    button {
+      width: 100%;
+      padding: 10px;
+      border: none;
+      border-radius: 6px;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+
+    button.primary {
+      background: #18A0FB;
+      color: #fff;
+    }
+
+    button.primary:hover:not(:disabled) {
+      background: #0d8ce0;
+    }
+
+    button:disabled {
+      opacity: 0.4;
+      cursor: not-allowed;
+    }
+
+    .status {
+      margin-top: 12px;
+      padding: 10px;
+      border-radius: 6px;
+      font-size: 12px;
+      display: none;
+    }
+
+    .status.success {
+      display: block;
+      background: #e6f9e6;
+      color: #2d7a2d;
+    }
+
+    .status.error {
+      display: block;
+      background: #fde8e8;
+      color: #c53030;
+    }
+  </style>
+</head>
+<body>
+  <h2>SAM Layer Importer</h2>
+  <p class="subtitle">Import SAM-segmented layers into Figma</p>
+
+  <div class="step">
+    <div class="step-label">Step 1: Paste metadata.json</div>
+    <textarea id="metadata" placeholder='Paste the contents of metadata.json here...'></textarea>
+  </div>
+
+  <div class="step">
+    <div class="step-label">Step 2: Select layer PNG files</div>
+    <div class="drop-zone" id="dropZone">
+      <span class="icon">+</span>
+      <p>Drop layer PNG files here or click to browse</p>
+    </div>
+    <input type="file" class="file-input" id="fileInput" multiple accept=".png" />
+    <div class="file-list" id="fileList"></div>
+  </div>
+
+  <button class="primary" id="importBtn" disabled>Import Layers</button>
+
+  <div class="status" id="status"></div>
+
+  <script>
+    const metadataInput = document.getElementById('metadata');
+    const dropZone = document.getElementById('dropZone');
+    const fileInput = document.getElementById('fileInput');
+    const fileList = document.getElementById('fileList');
+    const importBtn = document.getElementById('importBtn');
+    const status = document.getElementById('status');
+
+    let selectedFiles = {};
+
+    // Drop zone
+    dropZone.addEventListener('click', () => fileInput.click());
+
+    dropZone.addEventListener('dragover', (e) => {
+      e.preventDefault();
+      dropZone.classList.add('dragover');
+    });
+
+    dropZone.addEventListener('dragleave', () => {
+      dropZone.classList.remove('dragover');
+    });
+
+    dropZone.addEventListener('drop', (e) => {
+      e.preventDefault();
+      dropZone.classList.remove('dragover');
+      handleFiles(e.dataTransfer.files);
+    });
+
+    fileInput.addEventListener('change', (e) => {
+      handleFiles(e.target.files);
+    });
+
+    function handleFiles(files) {
+      for (const file of files) {
+        if (file.name.endsWith('.png')) {
+          const reader = new FileReader();
+          reader.onload = () => {
+            selectedFiles[file.name] = new Uint8Array(reader.result);
+            updateFileList();
+            checkReady();
+          };
+          reader.readAsArrayBuffer(file);
+        }
+      }
+    }
+
+    function updateFileList() {
+      const names = Object.keys(selectedFiles);
+      fileList.innerHTML = names
+        .map((n) => `<div class="file-item">${n}</div>`)
+        .join('');
+    }
+
+    function checkReady() {
+      const hasMetadata = metadataInput.value.trim().length > 0;
+      const hasFiles = Object.keys(selectedFiles).length > 0;
+      importBtn.disabled = !(hasMetadata && hasFiles);
+    }
+
+    metadataInput.addEventListener('input', checkReady);
+
+    // Import
+    importBtn.addEventListener('click', () => {
+      try {
+        const metadata = JSON.parse(metadataInput.value.trim());
+
+        // Validate metadata structure
+        if (!metadata.image_size || !metadata.layers || !metadata.classification) {
+          throw new Error('Invalid metadata format. Expected SAM output metadata.json.');
+        }
+
+        // Check which layer files are available
+        const missingFiles = metadata.layers
+          .filter((l) => !selectedFiles[l.filename])
+          .map((l) => l.filename);
+
+        if (missingFiles.length > 0 && missingFiles.length === metadata.layers.length) {
+          throw new Error(`No matching layer files found. Expected: ${missingFiles.slice(0, 3).join(', ')}...`);
+        }
+
+        importBtn.disabled = true;
+        importBtn.textContent = 'Importing...';
+
+        parent.postMessage({
+          pluginMessage: {
+            type: 'import-layers',
+            metadata: metadata,
+            images: selectedFiles,
+          },
+        }, '*');
+      } catch (err) {
+        status.className = 'status error';
+        status.textContent = err.message;
+        status.style.display = 'block';
+      }
+    });
+
+    // Response from plugin
+    window.onmessage = (event) => {
+      const msg = event.data.pluginMessage;
+      if (msg && msg.type === 'import-complete') {
+        status.className = 'status success';
+        status.textContent = `Successfully imported ${msg.count} layers.`;
+        status.style.display = 'block';
+        importBtn.textContent = 'Import Layers';
+        importBtn.disabled = false;
+      }
+    };
+  </script>
+</body>
+</html>

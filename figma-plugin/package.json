@@ -1,0 +1,13 @@
+{
+  "name": "sam-layer-importer-figma-plugin",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "build": "esbuild code.ts --bundle --outfile=code.js --target=es2017",
+    "watch": "esbuild code.ts --bundle --outfile=code.js --target=es2017 --watch"
+  },
+  "devDependencies": {
+    "@figma/plugin-typings": "^1.98.0",
+    "esbuild": "^0.20.0"
+  }
+}
