@@ -9,6 +9,7 @@ Automatically segment any image into individual layers using Meta's [Segment Any
 - **Automatic segmentation** - SAM detects and separates every object in an image
 - **Transparent PNG layers** - Each segment is exported as a cropped transparent PNG
 - **Smart classification** - Layers are auto-classified as background, foreground objects, or small elements
+- **AI background inpainting** - Background layer is automatically filled using [LaMa](https://github.com/advimman/lama) so moving foreground objects leaves no holes
 - **Figma integration** - Import layers into Figma with correct positioning via the included Figma plugin
 - **Claude Code / Desktop** - Use as an MCP server to segment images directly from Claude
 

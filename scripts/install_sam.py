@@ -26,7 +26,8 @@ def install_dependencies():
         "segment-anything",
         "opencv-python",
         "numpy",
-        "pillow"
+        "pillow",
+        "simple-lama-inpainting"
     ]
     
     for package in packages:
@@ -80,11 +81,24 @@ def verify_installation():
         import cv2
         import numpy as np
         from PIL import Image
-        
+        from simple_lama_inpainting import SimpleLama
+
         print("✅ All Python packages imported successfully")
         return True
     except ImportError as e:
         print(f"❌ Import failed: {e}")
+        return False
+
+def preload_lama():
+    """LaMaモデル事前ダウンロード"""
+    print("\n🎨 Preloading LaMa inpainting model...")
+    try:
+        from simple_lama_inpainting import SimpleLama
+        SimpleLama()  # 初回呼び出しでモデル自動DL
+        print("✅ LaMa model ready")
+        return True
+    except Exception as e:
+        print(f"❌ LaMa preload failed: {e}")
         return False
 
 def main():
@@ -104,7 +118,12 @@ def main():
     if not verify_installation():
         print("\n❌ Setup failed at verification")
         sys.exit(1)
-    
+
+    # LaMaモデル事前ダウンロード
+    if not preload_lama():
+        print("\n❌ Setup failed at LaMa preload")
+        sys.exit(1)
+
     print("\n✅ Setup completed successfully!")
     print("\nNext steps:")
     print("  1. npm install")
