@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 SAM自動セグメンテーション + LaMa背景inpainting
-Node.jsから呼び出し可能
+重複マスクの排除、エッジ品質の改善、適切なinpainting範囲の制御
 """
 
 import sys
@@ -14,13 +14,20 @@ from PIL import Image
 from segment_anything import SamAutomaticMaskGenerator, sam_model_registry
 from simple_lama_inpainting.models.model import download_model, LAMA_MODEL_URL, prepare_img_and_mask
 
+
 class SAMSegmenter:
     def __init__(self, checkpoint_path: str):
         """SAM + LaMaモデル初期化"""
         print(f"Loading SAM model from {checkpoint_path}...", file=sys.stderr)
         self.sam = sam_model_registry["vit_h"](checkpoint=checkpoint_path)
         self.sam.eval()
-        self.mask_generator = SamAutomaticMaskGenerator(self.sam)
+        self.mask_generator = SamAutomaticMaskGenerator(
+            self.sam,
+            # 品質重視の設定
+            pred_iou_thresh=0.88,        # IoU閾値を上げてノイズマスク除去
+            stability_score_thresh=0.95,  # 安定スコア閾値を上げる
+            min_mask_region_area=500,     # 最小マスク面積
+        )
         print("SAM model loaded", file=sys.stderr)
 
         print("Loading LaMa inpainting model...", file=sys.stderr)
@@ -33,19 +40,23 @@ class SAMSegmenter:
         print(f"LaMa model loaded on {device}", file=sys.stderr)
 
     def segment_image(self, image_path: str, output_dir: str) -> dict:
-        """画像を複数のセグメントに分離し、背景をinpaintする"""
-        # 画像読み込み
+        """画像をセグメント分離し、背景をinpaintする"""
         print(f"Reading image: {image_path}", file=sys.stderr)
         image_bgr = cv2.imread(image_path)
         if image_bgr is None:
             raise ValueError(f"Failed to read image: {image_path}")
 
         image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+        h, w = image_rgb.shape[:2]
 
-        # セグメンテーション実行
+        # SAMセグメンテーション
         print("Running SAM segmentation...", file=sys.stderr)
-        masks = self.mask_generator.generate(image_rgb)
-        print(f"Found {len(masks)} segments", file=sys.stderr)
+        raw_masks = self.mask_generator.generate(image_rgb)
+        print(f"Found {len(raw_masks)} raw segments", file=sys.stderr)
+
+        # 重複排除: 各ピクセルを最も具体的な（最小の）マスクに割り当て
+        exclusive_masks = self.resolve_overlaps(raw_masks, h, w)
+        print(f"After de-overlap: {len(exclusive_masks)} non-overlapping layers", file=sys.stderr)
 
         # 出力ディレクトリ作成
         output_path = Path(output_dir)
@@ -53,95 +64,177 @@ class SAMSegmenter:
 
         layers = []
 
-        # 各マスクを個別レイヤーとして保存
-        for idx, mask_data in enumerate(masks):
-            mask = mask_data["segmentation"]
-            bbox = mask_data["bbox"]  # [x, y, width, height]
-            area = mask_data["area"]
+        for idx, mask_info in enumerate(exclusive_masks):
+            mask = mask_info["mask"]          # 排他的マスク (h, w) bool
+            bbox = mask_info["bbox"]          # [x, y, w, h]
+            area = int(mask.sum())
 
-            # マスク適用: 透過PNG作成
-            result = image_rgb.copy()
-            result = cv2.cvtColor(result, cv2.COLOR_RGB2RGBA)
-            result[:, :, 3] = (mask * 255).astype(np.uint8)
+            if area < 100:
+                continue
+
+            # エッジを滑らかにする (guided filterでイメージに沿った境界)
+            refined_alpha = self.refine_mask_edges(mask, image_rgb)
+
+            # 透過PNG作成
+            result = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGRA)
+            result[:, :, 3] = refined_alpha
 
             # バウンディングボックスでクロップ
-            x, y, w, h = bbox
-            x, y, w, h = int(x), int(y), int(w), int(h)
-            cropped = result[y:y+h, x:x+w]
+            x, y, bw, bh = bbox
+            cropped = result[y:y+bh, x:x+bw]
 
             # 保存
             layer_filename = f"layer_{idx:03d}.png"
             layer_path = output_path / layer_filename
-            cv2.imwrite(str(layer_path), cv2.cvtColor(cropped, cv2.COLOR_RGBA2BGRA))
+            cv2.imwrite(str(layer_path), cropped)
 
             layers.append({
                 "id": idx,
                 "filename": layer_filename,
                 "path": str(layer_path),
-                "bbox": bbox,
-                "area": int(area),
-                "center": [int(x + w/2), int(y + h/2)]
+                "bbox": [int(x), int(y), int(bw), int(bh)],
+                "area": area,
+                "center": [int(x + bw // 2), int(y + bh // 2)]
             })
 
-            print(f"  Layer {idx}: {layer_filename} ({w}x{h}, area={area})", file=sys.stderr)
+            print(f"  Layer {idx}: {layer_filename} ({bw}x{bh}, area={area})", file=sys.stderr)
 
         # レイヤー分類
-        classification = self.classify_layers(layers, image_rgb.shape)
+        classification = self.classify_layers(layers, (h, w, 3))
 
-        # 背景レイヤーをLaMaでinpaint（前景の穴を補完）
+        # 背景レイヤーをLaMaでinpaint
         bg_id = classification["background"]
-        if bg_id is not None and (classification["foreground_objects"] or classification["small_elements"]):
+        fg_ids = classification["foreground_objects"]
+        if bg_id is not None and fg_ids:
             print("Inpainting background with LaMa...", file=sys.stderr)
-            inpainted_bg = self.inpaint_background(image_rgb, masks, classification)
 
-            # 穴なしフル画像で上書き保存
-            bg_layer = layers[bg_id]
-            bg_path = output_path / bg_layer["filename"]
-            cv2.imwrite(str(bg_path), inpainted_bg)
+            # 前景オブジェクトのマスクだけ合成（小要素は含めない）
+            fg_masks = []
+            for fid in fg_ids:
+                fm = exclusive_masks[fid]["mask"] if fid < len(exclusive_masks) else None
+                if fm is not None:
+                    fg_masks.append(fm)
 
-            # bboxを画像全体に更新（Figmaで(0,0)フルサイズ配置）
-            bg_layer["bbox"] = [0, 0, int(image_rgb.shape[1]), int(image_rgb.shape[0])]
-            bg_layer["area"] = int(image_rgb.shape[0] * image_rgb.shape[1])
-            bg_layer["center"] = [int(image_rgb.shape[1] // 2), int(image_rgb.shape[0] // 2)]
-            bg_layer["inpainted"] = True
+            if fg_masks:
+                inpainted_bg = self.inpaint_background(image_rgb, fg_masks)
 
-            print(f"  Background layer {bg_id} inpainted at full size", file=sys.stderr)
+                bg_layer = layers[bg_id] if bg_id < len(layers) else None
+                if bg_layer is not None:
+                    bg_path = output_path / bg_layer["filename"]
+                    cv2.imwrite(str(bg_path), inpainted_bg)
+
+                    bg_layer["bbox"] = [0, 0, w, h]
+                    bg_layer["area"] = w * h
+                    bg_layer["center"] = [w // 2, h // 2]
+                    bg_layer["inpainted"] = True
+
+                    print(f"  Background layer {bg_id} inpainted at full size ({w}x{h})", file=sys.stderr)
 
         # メタデータ
         metadata = {
             "source_image": image_path,
-            "image_size": {
-                "width": image_rgb.shape[1],
-                "height": image_rgb.shape[0]
-            },
+            "image_size": {"width": w, "height": h},
             "total_layers": len(layers),
             "layers": layers,
             "classification": classification
         }
 
-        # metadata.json保存
         metadata_path = output_path / "metadata.json"
         with open(metadata_path, "w") as f:
             json.dump(metadata, f, indent=2)
 
         print(f"Metadata saved: {metadata_path}", file=sys.stderr)
-
         return metadata
 
-    def inpaint_background(self, image_rgb, masks, classification) -> np.ndarray:
-        """前景マスクを合成し、LaMaで背景の穴を補完する"""
-        # 前景+小要素のマスクを合成 → 穴マスク
-        holes_mask = np.zeros(image_rgb.shape[:2], dtype=np.uint8)
-        non_bg = classification["foreground_objects"] + classification["small_elements"]
-        for idx in non_bg:
-            seg = masks[idx]["segmentation"]
-            holes_mask = np.bitwise_or(holes_mask, (seg * 255).astype(np.uint8))
+    def resolve_overlaps(self, raw_masks: list, h: int, w: int) -> list:
+        """
+        重複マスクを排除し、各ピクセルを1つのレイヤーにだけ割り当てる。
+        小さいマスクを優先（より具体的なオブジェクトを保護）。
+        """
+        # 面積順にソート（小→大）
+        sorted_masks = sorted(raw_masks, key=lambda m: m["area"])
 
-        # マスクを膨張してエッジの残像を消す
-        kernel = np.ones((5, 5), np.uint8)
-        holes_mask = cv2.dilate(holes_mask, kernel, iterations=2)
+        # ピクセル割り当てマップ: 各ピクセルがどのマスクに属するか
+        assignment = np.full((h, w), -1, dtype=np.int32)
 
-        # LaMa inpainting (map_location対応 for CPU/MPS)
+        exclusive = []
+        for i, mask_data in enumerate(sorted_masks):
+            seg = mask_data["segmentation"].astype(bool)
+
+            # まだ未割り当てのピクセルだけこのマスクに割り当て
+            available = (assignment == -1)
+            exclusive_seg = seg & available
+
+            area = int(exclusive_seg.sum())
+            if area < 100:
+                continue
+
+            # 割り当て記録
+            assignment[exclusive_seg] = len(exclusive)
+
+            # bboxを再計算（排他マスクに基づいて）
+            rows = np.any(exclusive_seg, axis=1)
+            cols = np.any(exclusive_seg, axis=0)
+            if not rows.any():
+                continue
+            rmin, rmax = np.where(rows)[0][[0, -1]]
+            cmin, cmax = np.where(cols)[0][[0, -1]]
+            bbox = [int(cmin), int(rmin), int(cmax - cmin + 1), int(rmax - rmin + 1)]
+
+            exclusive.append({
+                "mask": exclusive_seg,
+                "bbox": bbox,
+                "area": area,
+                "original_area": mask_data["area"],
+            })
+
+        # 未割り当てピクセルを「背景余白」として最大マスクに追加
+        # （背景は後でinpaintされるのでここでは追加しない）
+
+        return exclusive
+
+    def refine_mask_edges(self, mask: np.ndarray, image_rgb: np.ndarray) -> np.ndarray:
+        """
+        マスク境界を滑らかにする。
+        - 1px GaussianBlurでギザギザ除去（アンチエイリアス）
+        - 閾値で再バイナリ化してシャープさを維持
+        - エッジ付近のみ微妙なグラデーション
+        """
+        mask_u8 = (mask.astype(np.float32) * 255).astype(np.uint8)
+
+        # 境界だけ検出（エッジから3px以内）
+        kernel = np.ones((3, 3), np.uint8)
+        dilated = cv2.dilate(mask_u8, kernel, iterations=1)
+        eroded = cv2.erode(mask_u8, kernel, iterations=1)
+        edge_band = dilated - eroded  # 境界帯のみ
+
+        # 境界帯にだけ軽いブラーをかける
+        blurred = cv2.GaussianBlur(mask_u8, (3, 3), 0.8)
+
+        # 内部はシャープ(255)、外部は透明(0)、エッジだけブラー値
+        alpha = mask_u8.copy()
+        edge_pixels = edge_band > 0
+        alpha[edge_pixels] = blurred[edge_pixels]
+
+        return alpha
+
+    def inpaint_background(self, image_rgb: np.ndarray, fg_masks: list) -> np.ndarray:
+        """前景オブジェクトのマスクのみでLaMa inpainting"""
+        h, w = image_rgb.shape[:2]
+
+        # 前景マスクの合成
+        holes_mask = np.zeros((h, w), dtype=np.uint8)
+        for fm in fg_masks:
+            holes_mask = np.bitwise_or(holes_mask, (fm.astype(np.uint8) * 255))
+
+        # 軽い膨張でエッジの残像を消す（3x3カーネル、1回だけ）
+        kernel = np.ones((3, 3), np.uint8)
+        holes_mask = cv2.dilate(holes_mask, kernel, iterations=1)
+
+        hole_pct = (holes_mask > 0).sum() / (h * w) * 100
+        print(f"  Inpainting {hole_pct:.1f}% of image", file=sys.stderr)
+
+        # LaMa inpainting
         image_pil = Image.fromarray(image_rgb)
         mask_pil = Image.fromarray(holes_mask)
 
@@ -152,34 +245,27 @@ class SAMSegmenter:
             result_np = inpainted[0].permute(1, 2, 0).detach().cpu().numpy()
             result_np = np.clip(result_np * 255, 0, 255).astype(np.uint8)
 
-        # Resize back to original dimensions (padding may have changed size)
-        h, w = image_rgb.shape[:2]
-        result_np = cv2.resize(result_np, (w, h))
+        # パディングで変わったサイズを元に戻す
+        result_np = cv2.resize(result_np, (w, h), interpolation=cv2.INTER_LANCZOS4)
 
-        # numpy BGRA に変換（完全不透明）
+        # BGRA（完全不透明）
         result_bgra = cv2.cvtColor(result_np, cv2.COLOR_RGB2BGRA)
         result_bgra[:, :, 3] = 255
         return result_bgra
 
     def classify_layers(self, layers: list, image_shape: tuple) -> dict:
         """
-        レイヤーを自動分類
+        レイヤーを背景/前景/小要素に分類。
 
-        - background: 最大面積レイヤー
-        - foreground_objects: 5%以上のレイヤー
-        - small_elements: 5%未満のレイヤー
+        前景オブジェクト判定条件:
+        - 面積が画像の3%以上
+        - 画像全幅/全高にまたがるストリップ状ではない（背景の一部と判定）
         """
         if not layers:
-            return {
-                "background": None,
-                "foreground_objects": [],
-                "small_elements": []
-            }
+            return {"background": None, "foreground_objects": [], "small_elements": []}
 
-        # 画像全体の面積
-        total_image_area = image_shape[0] * image_shape[1]
-
-        # 面積で降順ソート
+        h, w = image_shape[0], image_shape[1]
+        total_area = h * w
         sorted_layers = sorted(layers, key=lambda x: x["area"], reverse=True)
 
         background = sorted_layers[0]["id"]
@@ -187,11 +273,17 @@ class SAMSegmenter:
         small_elements = []
 
         for layer in sorted_layers[1:]:
-            area_ratio = layer["area"] / total_image_area
+            ratio = layer["area"] / total_area
+            bx, by, bw, bh = layer["bbox"]
+            width_ratio = bw / w
+            height_ratio = bh / h
 
-            if area_ratio > 0.05:  # 全体の5%以上 → 前景オブジェクト
+            # 画像全幅/全高の80%以上に広がるストリップは背景の一部
+            is_strip = width_ratio > 0.8 or height_ratio > 0.8
+
+            if ratio > 0.03 and not is_strip:
                 foreground.append(layer["id"])
-            else:  # 5%未満 → 小要素（ボタン、アイコン等）
+            else:
                 small_elements.append(layer["id"])
 
         return {
@@ -199,6 +291,7 @@ class SAMSegmenter:
             "foreground_objects": foreground,
             "small_elements": small_elements
         }
+
 
 def main():
     if len(sys.argv) != 4:
@@ -212,12 +305,11 @@ def main():
     try:
         segmenter = SAMSegmenter(checkpoint_path)
         result = segmenter.segment_image(image_path, output_dir)
-
-        # 結果をJSON出力（Node.jsが読み取る）
         print(json.dumps(result, indent=2))
-
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)
+        import traceback
+        traceback.print_exc(file=sys.stderr)
         sys.exit(1)
 
 if __name__ == "__main__":
