@@ -28,8 +28,7 @@
     "url": "https://github.com/fujikento/sam-figma-layer.git"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.0.4",
-    "sharp": "^0.33.2"
+    "@modelcontextprotocol/sdk": "^1.0.4"
   },
   "devDependencies": {
     "@types/node": "^20.11.19",

@@ -82,6 +82,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           outputDir?: string;
         };
 
+        if (!imagePath || !path.isAbsolute(imagePath)) {
+          throw new Error('imagePath must be an absolute file path');
+        }
+
         const outDir =
           outputDir || path.join(os.tmpdir(), `sam_output_${Date.now()}`);
 

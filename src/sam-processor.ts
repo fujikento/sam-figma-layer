@@ -1,10 +1,11 @@
-import { exec } from 'child_process';
+import { execFile } from 'child_process';
 import { promisify } from 'util';
-import { readFile } from 'fs/promises';
+import { access, constants } from 'fs/promises';
 import path from 'path';
 import os from 'os';
+import { fileURLToPath } from 'url';
 
-const execAsync = promisify(exec);
+const execFileAsync = promisify(execFile);
 
 export interface SAMLayer {
   id: number;
@@ -35,8 +36,9 @@ export class SAMProcessor {
   private scriptPath: string;
 
   constructor() {
-    // Resolve script path relative to this package's root
-    const packageRoot = path.resolve(new URL('.', import.meta.url).pathname, '..');
+    // Resolve script path relative to this package's root (Windows-safe)
+    const currentDir = path.dirname(fileURLToPath(import.meta.url));
+    const packageRoot = path.resolve(currentDir, '..');
     this.scriptPath = path.join(packageRoot, 'scripts', 'sam_segmenter.py');
 
     // Model stored in user-agnostic location
@@ -44,16 +46,17 @@ export class SAMProcessor {
   }
 
   async segment(imagePath: string, outputDir: string): Promise<SAMResult> {
-    // Pythonスクリプト実行
-    const command = `python3 "${this.scriptPath}" "${this.checkpointPath}" "${imagePath}" "${outputDir}"`;
-
     try {
-      const { stdout, stderr } = await execAsync(command, {
-        maxBuffer: 10 * 1024 * 1024, // 10MB
-        timeout: 300000 // 5分タイムアウト
-      });
+      // Use execFile to avoid command injection
+      const { stdout } = await execFileAsync(
+        'python3',
+        [this.scriptPath, this.checkpointPath, imagePath, outputDir],
+        {
+          maxBuffer: 10 * 1024 * 1024, // 10MB
+          timeout: 300000, // 5 min
+        }
+      );
 
-      // stdoutからJSON結果をパース
       const result: SAMResult = JSON.parse(stdout);
       return result;
     } catch (error: any) {
@@ -63,8 +66,8 @@ export class SAMProcessor {
 
   async isReady(): Promise<boolean> {
     try {
-      // チェックポイントファイル存在確認
-      await readFile(this.checkpointPath);
+      // Check file existence without reading the entire 2.4GB model into memory
+      await access(this.checkpointPath, constants.F_OK);
       return true;
     } catch {
       return false;
