@@ -1,5 +1,5 @@
-segment-anything
-opencv-python
-numpy
-pillow
-simple-lama-inpainting
+segment-anything>=1.0
+opencv-python>=4.8.0
+numpy>=1.24.0
+pillow>=10.0.0
+simple-lama-inpainting>=0.1.0

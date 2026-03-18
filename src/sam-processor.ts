@@ -14,6 +14,7 @@ export interface SAMLayer {
   bbox: number[];
   area: number;
   center: number[];
+  inpainted?: boolean;
 }
 
 export interface SAMResult {

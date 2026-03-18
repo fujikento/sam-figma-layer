@@ -139,6 +139,8 @@ class SAMSegmenter:
         image_pil = Image.fromarray(image_rgb)
         mask_pil = Image.fromarray(holes_mask)
         result_pil = self.lama(image_pil, mask_pil)
+        if result_pil is None:
+            raise RuntimeError("LaMa inpainting returned None")
 
         # numpy BGRA に変換（完全不透明）
         result_rgb = np.array(result_pil)

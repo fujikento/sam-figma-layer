@@ -4,6 +4,7 @@ interface LayerData {
   bbox: number[];
   area: number;
   center: number[];
+  inpainted?: boolean;
 }
 
 interface SAMMetadata {
