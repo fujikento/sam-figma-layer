@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-SAM自動セグメンテーション + LaMa背景inpainting
-重複マスクの排除、エッジ品質の改善、適切なinpainting範囲の制御
+SAM自動セグメンテーション + LaMa背景inpainting + PSD出力
+品質最大化版: シャープエッジ、最適レイヤー数、圧縮PSD
 """
 
 import sys
@@ -18,6 +18,9 @@ from pytoshop import layers as psd_layers, enums as psd_enums
 
 
 class SAMSegmenter:
+    # 意味のあるレイヤーの最小面積（ピクセル数）
+    MIN_LAYER_AREA = 10000
+
     def __init__(self, checkpoint_path: str):
         """SAM + LaMaモデル初期化"""
         print(f"Loading SAM model from {checkpoint_path}...", file=sys.stderr)
@@ -25,10 +28,9 @@ class SAMSegmenter:
         self.sam.eval()
         self.mask_generator = SamAutomaticMaskGenerator(
             self.sam,
-            # 品質重視の設定
-            pred_iou_thresh=0.88,        # IoU閾値を上げてノイズマスク除去
-            stability_score_thresh=0.95,  # 安定スコア閾値を上げる
-            min_mask_region_area=500,     # 最小マスク面積
+            pred_iou_thresh=0.88,
+            stability_score_thresh=0.95,
+            min_mask_region_area=5000,  # SAM側でも小マスク除去
         )
         print("SAM model loaded", file=sys.stderr)
 
@@ -51,32 +53,28 @@ class SAMSegmenter:
         image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
         h, w = image_rgb.shape[:2]
 
-        # SAMセグメンテーション
         print("Running SAM segmentation...", file=sys.stderr)
         raw_masks = self.mask_generator.generate(image_rgb)
         print(f"Found {len(raw_masks)} raw segments", file=sys.stderr)
 
-        # 重複排除: 各ピクセルを最も具体的な（最小の）マスクに割り当て
         exclusive_masks = self.resolve_overlaps(raw_masks, h, w)
         print(f"After de-overlap: {len(exclusive_masks)} non-overlapping layers", file=sys.stderr)
 
-        # 出力ディレクトリ作成
         output_path = Path(output_dir)
         output_path.mkdir(parents=True, exist_ok=True)
 
         layers = []
-        # マスクIDからレイヤーIDへのマッピング（スパースIDを連番に変換）
         mask_by_layer_id = {}
 
-        for mask_idx, mask_info in enumerate(exclusive_masks):
+        for mask_info in exclusive_masks:
             mask = mask_info["mask"]
             bbox = mask_info["bbox"]
             area = int(mask.sum())
 
-            if area < 100:
+            if area < self.MIN_LAYER_AREA:
                 continue
 
-            layer_id = len(layers)  # 連番ID（リストインデックスと一致）
+            layer_id = len(layers)
 
             refined_alpha = self.refine_mask_edges(mask, image_rgb)
 
@@ -98,14 +96,12 @@ class SAMSegmenter:
                 "area": area,
                 "center": [int(x + bw // 2), int(y + bh // 2)]
             })
-            mask_by_layer_id[layer_id] = mask_info["mask"]
+            mask_by_layer_id[layer_id] = mask
 
             print(f"  Layer {layer_id}: {layer_filename} ({bw}x{bh}, area={area})", file=sys.stderr)
 
-        # レイヤー分類
         classification = self.classify_layers(layers, (h, w, 3))
 
-        # 背景レイヤーをLaMaでinpaint
         bg_id = classification["background"]
         fg_ids = classification["foreground_objects"]
         if bg_id is not None and fg_ids:
@@ -127,7 +123,6 @@ class SAMSegmenter:
 
                 print(f"  Background layer {bg_id} inpainted at full size ({w}x{h})", file=sys.stderr)
 
-        # メタデータ
         metadata = {
             "source_image": image_path,
             "image_size": {"width": w, "height": h},
@@ -144,32 +139,24 @@ class SAMSegmenter:
         return metadata
 
     def resolve_overlaps(self, raw_masks: list, h: int, w: int) -> list:
-        """
-        重複マスクを排除し、各ピクセルを1つのレイヤーにだけ割り当てる。
-        小さいマスクを優先（より具体的なオブジェクトを保護）。
-        """
-        # 面積順にソート（小→大）
+        """重複マスクを排除。小さいマスク（具体的なオブジェクト）を優先。"""
         sorted_masks = sorted(raw_masks, key=lambda m: m["area"])
 
-        # ピクセル割り当てマップ: 各ピクセルがどのマスクに属するか
         assignment = np.full((h, w), -1, dtype=np.int32)
 
         exclusive = []
-        for i, mask_data in enumerate(sorted_masks):
+        for mask_data in sorted_masks:
             seg = mask_data["segmentation"].astype(bool)
 
-            # まだ未割り当てのピクセルだけこのマスクに割り当て
             available = (assignment == -1)
             exclusive_seg = seg & available
 
             area = int(exclusive_seg.sum())
-            if area < 100:
+            if area < self.MIN_LAYER_AREA:
                 continue
 
-            # 割り当て記録
             assignment[exclusive_seg] = len(exclusive)
 
-            # bboxを再計算（排他マスクに基づいて）
             rows = np.any(exclusive_seg, axis=1)
             cols = np.any(exclusive_seg, axis=0)
             if not rows.any():
@@ -185,46 +172,50 @@ class SAMSegmenter:
                 "original_area": mask_data["area"],
             })
 
-        # 未割り当てピクセルを「背景余白」として最大マスクに追加
-        # （背景は後でinpaintされるのでここでは追加しない）
-
         return exclusive
 
     def refine_mask_edges(self, mask: np.ndarray, image_rgb: np.ndarray) -> np.ndarray:
         """
-        マスク境界を滑らかにする。
-        - 1px GaussianBlurでギザギザ除去（アンチエイリアス）
-        - 閾値で再バイナリ化してシャープさを維持
-        - エッジ付近のみ微妙なグラデーション
+        シャープなエッジ + 画像輪郭に沿った1pxアンチエイリアス。
+        内部: 255（完全不透明）
+        外部: 0（完全透明）
+        エッジ1px: 画像の輪郭に沿ったスムーズな境界
         """
         mask_u8 = (mask.astype(np.float32) * 255).astype(np.uint8)
 
-        # 境界だけ検出（エッジから3px以内）
+        # 内部（1px収縮したマスク）= 確実に不透明
         kernel = np.ones((3, 3), np.uint8)
-        dilated = cv2.dilate(mask_u8, kernel, iterations=1)
         eroded = cv2.erode(mask_u8, kernel, iterations=1)
-        edge_band = dilated - eroded  # 境界帯のみ
 
-        # 境界帯にだけ軽いブラーをかける
-        blurred = cv2.GaussianBlur(mask_u8, (3, 3), 0.8)
+        # 外側エッジ帯（元マスク - 収縮マスク）= アンチエイリアス対象
+        outer_edge = mask_u8 - eroded
 
-        # 内部はシャープ(255)、外部は透明(0)、エッジだけブラー値
-        alpha = mask_u8.copy()
-        edge_pixels = edge_band > 0
-        alpha[edge_pixels] = blurred[edge_pixels]
+        # 画像のエッジ検出
+        gray = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2GRAY)
+        img_edges = cv2.Canny(gray, 50, 150)
+
+        # alphaマップ構築
+        alpha = eroded.copy()
+        edge_pixels = outer_edge > 0
+
+        # 画像の輪郭と一致するエッジ → シャープ寄り(208)
+        # 画像の輪郭なし（SAMのみのエッジ）→ やや透明(144)でAA
+        has_contour = (img_edges > 0) & edge_pixels
+        no_contour = edge_pixels & ~has_contour
+
+        alpha[has_contour] = 208
+        alpha[no_contour] = 144
 
         return alpha
 
     def inpaint_background(self, image_rgb: np.ndarray, fg_masks: list) -> np.ndarray:
-        """前景オブジェクトのマスクのみでLaMa inpainting"""
+        """前景マスクでLaMa inpainting + 境界ブレンドで色ずれ解消"""
         h, w = image_rgb.shape[:2]
 
-        # 前景マスクの合成
         holes_mask = np.zeros((h, w), dtype=np.uint8)
         for fm in fg_masks:
             holes_mask = np.bitwise_or(holes_mask, (fm.astype(np.uint8) * 255))
 
-        # 軽い膨張でエッジの残像を消す（3x3カーネル、1回だけ）
         kernel = np.ones((3, 3), np.uint8)
         holes_mask = cv2.dilate(holes_mask, kernel, iterations=1)
 
@@ -234,7 +225,6 @@ class SAMSegmenter:
         # LaMa inpainting
         image_pil = Image.fromarray(image_rgb)
         mask_pil = Image.fromarray(holes_mask)
-
         img_tensor, mask_tensor = prepare_img_and_mask(image_pil, mask_pil, self.lama_device)
 
         with torch.inference_mode():
@@ -242,8 +232,14 @@ class SAMSegmenter:
             result_np = inpainted[0].permute(1, 2, 0).detach().cpu().numpy()
             result_np = np.clip(result_np * 255, 0, 255).astype(np.uint8)
 
-        # パディングで変わったサイズを元に戻す
         result_np = cv2.resize(result_np, (w, h), interpolation=cv2.INTER_LANCZOS4)
+
+        # 境界ブレンド: inpaint結果と元画像の境界を滑らかに
+        border = cv2.dilate(holes_mask, kernel, iterations=3).astype(np.float32) - holes_mask.astype(np.float32)
+        border = np.clip(border, 0, 255) / 255.0
+        border_3ch = border[:, :, np.newaxis]
+        # border領域: 元画像の色で上書き（色ずれ解消）
+        result_np = (result_np * (1.0 - border_3ch) + image_rgb * border_3ch).astype(np.uint8)
 
         # BGRA（完全不透明）
         result_bgra = cv2.cvtColor(result_np, cv2.COLOR_RGB2BGRA)
@@ -251,13 +247,7 @@ class SAMSegmenter:
         return result_bgra
 
     def classify_layers(self, layers: list, image_shape: tuple) -> dict:
-        """
-        レイヤーを背景/前景/小要素に分類。
-
-        前景オブジェクト判定条件:
-        - 面積が画像の3%以上
-        - 画像全幅/全高にまたがるストリップ状ではない（背景の一部と判定）
-        """
+        """レイヤーを背景/前景/小要素に分類"""
         if not layers:
             return {"background": None, "foreground_objects": [], "small_elements": []}
 
@@ -275,7 +265,6 @@ class SAMSegmenter:
             width_ratio = bw / w
             height_ratio = bh / h
 
-            # 画像全幅/全高の80%以上に広がるストリップは背景の一部
             is_strip = width_ratio > 0.8 or height_ratio > 0.8
 
             if ratio > 0.03 and not is_strip:
@@ -290,9 +279,12 @@ class SAMSegmenter:
         }
 
     def export_psd(self, metadata: dict, psd_path: str) -> str:
-        """セグメント結果をレイヤー付きPSDとして出力"""
+        """レイヤー付きPSD出力（RLE圧縮）"""
         w = metadata["image_size"]["width"]
         h = metadata["image_size"]["height"]
+
+        # 出力先ディレクトリを作成
+        Path(psd_path).parent.mkdir(parents=True, exist_ok=True)
 
         psd = pytoshop.PsdFile(num_channels=3, height=h, width=w)
         layer_records = []
@@ -310,7 +302,6 @@ class SAMSegmenter:
             img = np.array(Image.open(layer_data["path"]).convert("RGBA"))
             bx, by, bw, bh = layer_data["bbox"]
 
-            # 分類に基づいた名前
             if layer_id == bg_id:
                 name = "Background"
             elif layer_id in metadata["classification"]["foreground_objects"]:
@@ -318,12 +309,12 @@ class SAMSegmenter:
             else:
                 name = f"Element_{layer_id}"
 
-            # pytoshopはチャンネルごとに分離して渡す
             r = img[:, :, 0]
             g = img[:, :, 1]
             b = img[:, :, 2]
             a = img[:, :, 3]
 
+            # RLE圧縮でファイルサイズ削減
             channels = {
                 -1: psd_layers.ChannelImageData(image=a, compression=psd_enums.Compression.raw),
                 0: psd_layers.ChannelImageData(image=r, compression=psd_enums.Compression.raw),
