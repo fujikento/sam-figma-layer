@@ -8,10 +8,11 @@ import sys
 import json
 import cv2
 import numpy as np
+import torch
 from pathlib import Path
 from PIL import Image
 from segment_anything import SamAutomaticMaskGenerator, sam_model_registry
-from simple_lama_inpainting import SimpleLama
+from simple_lama_inpainting.models.model import download_model, LAMA_MODEL_URL, prepare_img_and_mask
 
 class SAMSegmenter:
     def __init__(self, checkpoint_path: str):
@@ -23,8 +24,13 @@ class SAMSegmenter:
         print("SAM model loaded", file=sys.stderr)
 
         print("Loading LaMa inpainting model...", file=sys.stderr)
-        self.lama = SimpleLama()
-        print("LaMa model loaded", file=sys.stderr)
+        device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+        model_path = download_model(LAMA_MODEL_URL)
+        self.lama_model = torch.jit.load(model_path, map_location=device)
+        self.lama_model.eval()
+        self.lama_model.to(device)
+        self.lama_device = device
+        print(f"LaMa model loaded on {device}", file=sys.stderr)
 
     def segment_image(self, image_path: str, output_dir: str) -> dict:
         """画像を複数のセグメントに分離し、背景をinpaintする"""
@@ -135,16 +141,23 @@ class SAMSegmenter:
         kernel = np.ones((5, 5), np.uint8)
         holes_mask = cv2.dilate(holes_mask, kernel, iterations=2)
 
-        # LaMa inpainting
+        # LaMa inpainting (map_location対応 for CPU/MPS)
         image_pil = Image.fromarray(image_rgb)
         mask_pil = Image.fromarray(holes_mask)
-        result_pil = self.lama(image_pil, mask_pil)
-        if result_pil is None:
-            raise RuntimeError("LaMa inpainting returned None")
+
+        img_tensor, mask_tensor = prepare_img_and_mask(image_pil, mask_pil, self.lama_device)
+
+        with torch.inference_mode():
+            inpainted = self.lama_model(img_tensor, mask_tensor)
+            result_np = inpainted[0].permute(1, 2, 0).detach().cpu().numpy()
+            result_np = np.clip(result_np * 255, 0, 255).astype(np.uint8)
+
+        # Resize back to original dimensions (padding may have changed size)
+        h, w = image_rgb.shape[:2]
+        result_np = cv2.resize(result_np, (w, h))
 
         # numpy BGRA に変換（完全不透明）
-        result_rgb = np.array(result_pil)
-        result_bgra = cv2.cvtColor(result_rgb, cv2.COLOR_RGB2BGRA)
+        result_bgra = cv2.cvtColor(result_np, cv2.COLOR_RGB2BGRA)
         result_bgra[:, :, 3] = 255
         return result_bgra
 

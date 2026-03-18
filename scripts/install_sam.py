@@ -93,9 +93,13 @@ def preload_lama():
     """LaMaモデル事前ダウンロード"""
     print("\n🎨 Preloading LaMa inpainting model...")
     try:
-        from simple_lama_inpainting import SimpleLama
-        SimpleLama()  # 初回呼び出しでモデル自動DL
-        print("✅ LaMa model ready")
+        import torch
+        from simple_lama_inpainting.models.model import download_model, LAMA_MODEL_URL
+        model_path = download_model(LAMA_MODEL_URL)
+        device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+        model = torch.jit.load(model_path, map_location=device)
+        del model
+        print(f"✅ LaMa model ready (device: {device})")
         return True
     except Exception as e:
         print(f"❌ LaMa preload failed: {e}")
