@@ -46,6 +46,26 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      name: 'segment_and_export_psd',
+      description:
+        'Segment an image into layers and export as a layered PSD file. Includes LaMa background inpainting. Output works in Photoshop, After Effects, Unity, etc.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          imagePath: {
+            type: 'string',
+            description: 'Absolute path to the input image',
+          },
+          psdPath: {
+            type: 'string',
+            description:
+              'Output PSD file path (defaults to same directory as input image)',
+          },
+        },
+        required: ['imagePath'],
+      },
+    },
+    {
       name: 'check_sam_status',
       description:
         'Check if the SAM model is installed and ready. Run `npm run setup` if not ready.',
@@ -116,6 +136,49 @@ ${result.layers
 To place these layers in Figma via figma-console MCP:
 1. Create a parent frame sized ${result.image_size.width}x${result.image_size.height}
 2. For each layer, create a rectangle at the bbox position and set the layer PNG as an image fill`,
+            },
+          ],
+        };
+      }
+
+      case 'segment_and_export_psd': {
+        const { imagePath, psdPath } = args as {
+          imagePath: string;
+          psdPath?: string;
+        };
+
+        if (!imagePath || !path.isAbsolute(imagePath)) {
+          throw new Error('imagePath must be an absolute file path');
+        }
+
+        const outDir = path.join(os.tmpdir(), `sam_output_${Date.now()}`);
+        const outputPsd =
+          psdPath ||
+          path.join(
+            path.dirname(imagePath),
+            `${path.basename(imagePath, path.extname(imagePath))}_layers.psd`
+          );
+
+        const result = await samProcessor.segmentAndExportPsd(
+          imagePath,
+          outDir,
+          outputPsd
+        );
+
+        return {
+          content: [
+            {
+              type: 'text',
+              text: `PSD export complete.
+
+- PSD file: ${outputPsd}
+- Total layers: ${result.total_layers}
+- Background: Layer ${result.classification.background} (inpainted)
+- Foreground objects: ${result.classification.foreground_objects.length}
+- Small elements: ${result.classification.small_elements.length}
+- Image size: ${result.image_size.width}x${result.image_size.height}
+
+The PSD file contains all layers with correct positioning and can be opened in Photoshop, After Effects, Krita, or any PSD-compatible application.`,
             },
           ],
         };

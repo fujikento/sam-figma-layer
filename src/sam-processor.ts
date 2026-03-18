@@ -65,6 +65,37 @@ export class SAMProcessor {
     }
   }
 
+  async segmentAndExportPsd(
+    imagePath: string,
+    outputDir: string,
+    psdPath: string
+  ): Promise<SAMResult> {
+    try {
+      const { stdout } = await execFileAsync(
+        'python3',
+        [
+          this.scriptPath,
+          this.checkpointPath,
+          imagePath,
+          outputDir,
+          '--psd',
+          psdPath,
+        ],
+        {
+          maxBuffer: 10 * 1024 * 1024,
+          timeout: 600000, // 10 min (PSD export takes longer)
+        }
+      );
+
+      const result: SAMResult = JSON.parse(stdout);
+      return result;
+    } catch (error: any) {
+      throw new Error(
+        `SAM segmentation + PSD export failed: ${error.message}\n${error.stderr || ''}`
+      );
+    }
+  }
+
   async isReady(): Promise<boolean> {
     try {
       // Check file existence without reading the entire 2.4GB model into memory

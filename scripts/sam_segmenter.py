@@ -13,6 +13,8 @@ from pathlib import Path
 from PIL import Image
 from segment_anything import SamAutomaticMaskGenerator, sam_model_registry
 from simple_lama_inpainting.models.model import download_model, LAMA_MODEL_URL, prepare_img_and_mask
+import pytoshop
+from pytoshop import layers as psd_layers, enums as psd_enums
 
 
 class SAMSegmenter:
@@ -292,19 +294,81 @@ class SAMSegmenter:
             "small_elements": small_elements
         }
 
+    def export_psd(self, metadata: dict, psd_path: str) -> str:
+        """セグメント結果をレイヤー付きPSDとして出力"""
+        w = metadata["image_size"]["width"]
+        h = metadata["image_size"]["height"]
+
+        psd = pytoshop.PsdFile(num_channels=3, height=h, width=w)
+        layer_records = []
+
+        # レイヤー順序: 背景 → 小要素 → 前景（上が前面）
+        ordered_ids = []
+        bg_id = metadata["classification"]["background"]
+        if bg_id is not None:
+            ordered_ids.append(bg_id)
+        ordered_ids.extend(metadata["classification"]["small_elements"])
+        ordered_ids.extend(metadata["classification"]["foreground_objects"])
+
+        for layer_id in ordered_ids:
+            layer_data = metadata["layers"][layer_id]
+            img = np.array(Image.open(layer_data["path"]).convert("RGBA"))
+            bx, by, bw, bh = layer_data["bbox"]
+
+            # 分類に基づいた名前
+            if layer_id == bg_id:
+                name = "Background"
+            elif layer_id in metadata["classification"]["foreground_objects"]:
+                name = f"Object_{layer_id}"
+            else:
+                name = f"Element_{layer_id}"
+
+            # pytoshopはチャンネルごとに分離して渡す
+            r = img[:, :, 0]
+            g = img[:, :, 1]
+            b = img[:, :, 2]
+            a = img[:, :, 3]
+
+            channels = {
+                -1: psd_layers.ChannelImageData(image=a, compression=psd_enums.Compression.raw),
+                0: psd_layers.ChannelImageData(image=r, compression=psd_enums.Compression.raw),
+                1: psd_layers.ChannelImageData(image=g, compression=psd_enums.Compression.raw),
+                2: psd_layers.ChannelImageData(image=b, compression=psd_enums.Compression.raw),
+            }
+
+            record = psd_layers.LayerRecord(
+                top=by, left=bx, bottom=by + bh, right=bx + bw,
+                name=name,
+                channels=channels,
+            )
+            layer_records.append(record)
+
+        layer_info = psd_layers.LayerInfo(layer_records=layer_records)
+        psd.layer_and_mask_info = psd_layers.LayerAndMaskInfo(layer_info=layer_info)
+
+        with open(psd_path, 'wb') as f:
+            psd.write(f)
+
+        print(f"PSD exported: {psd_path} ({len(layer_records)} layers)", file=sys.stderr)
+        return psd_path
+
 
 def main():
-    if len(sys.argv) != 4:
-        print("Usage: python sam_segmenter.py <checkpoint_path> <image_path> <output_dir>", file=sys.stderr)
-        sys.exit(1)
-
-    checkpoint_path = sys.argv[1]
-    image_path = sys.argv[2]
-    output_dir = sys.argv[3]
+    import argparse
+    parser = argparse.ArgumentParser(description="SAM image segmentation + LaMa inpainting")
+    parser.add_argument("checkpoint_path", help="Path to SAM model checkpoint")
+    parser.add_argument("image_path", help="Path to input image")
+    parser.add_argument("output_dir", help="Output directory for layer PNGs")
+    parser.add_argument("--psd", help="Also export as layered PSD file", metavar="PSD_PATH")
+    args = parser.parse_args()
 
     try:
-        segmenter = SAMSegmenter(checkpoint_path)
-        result = segmenter.segment_image(image_path, output_dir)
+        segmenter = SAMSegmenter(args.checkpoint_path)
+        result = segmenter.segment_image(args.image_path, args.output_dir)
+
+        if args.psd:
+            segmenter.export_psd(result, args.psd)
+
         print(json.dumps(result, indent=2))
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)
