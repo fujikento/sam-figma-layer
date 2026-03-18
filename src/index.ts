@@ -173,7 +173,7 @@ To place these layers in Figma via figma-console MCP:
 
 - PSD file: ${outputPsd}
 - Total layers: ${result.total_layers}
-- Background: Layer ${result.classification.background} (inpainted)
+- Background: Layer ${result.classification.background}${result.classification.foreground_objects.length > 0 ? ' (inpainted)' : ''}
 - Foreground objects: ${result.classification.foreground_objects.length}
 - Small elements: ${result.classification.small_elements.length}
 - Image size: ${result.image_size.width}x${result.image_size.height}

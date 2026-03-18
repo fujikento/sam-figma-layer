@@ -65,41 +65,42 @@ class SAMSegmenter:
         output_path.mkdir(parents=True, exist_ok=True)
 
         layers = []
+        # マスクIDからレイヤーIDへのマッピング（スパースIDを連番に変換）
+        mask_by_layer_id = {}
 
-        for idx, mask_info in enumerate(exclusive_masks):
-            mask = mask_info["mask"]          # 排他的マスク (h, w) bool
-            bbox = mask_info["bbox"]          # [x, y, w, h]
+        for mask_idx, mask_info in enumerate(exclusive_masks):
+            mask = mask_info["mask"]
+            bbox = mask_info["bbox"]
             area = int(mask.sum())
 
             if area < 100:
                 continue
 
-            # エッジを滑らかにする (guided filterでイメージに沿った境界)
+            layer_id = len(layers)  # 連番ID（リストインデックスと一致）
+
             refined_alpha = self.refine_mask_edges(mask, image_rgb)
 
-            # 透過PNG作成
             result = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGRA)
             result[:, :, 3] = refined_alpha
 
-            # バウンディングボックスでクロップ
             x, y, bw, bh = bbox
             cropped = result[y:y+bh, x:x+bw]
 
-            # 保存
-            layer_filename = f"layer_{idx:03d}.png"
+            layer_filename = f"layer_{layer_id:03d}.png"
             layer_path = output_path / layer_filename
             cv2.imwrite(str(layer_path), cropped)
 
             layers.append({
-                "id": idx,
+                "id": layer_id,
                 "filename": layer_filename,
                 "path": str(layer_path),
                 "bbox": [int(x), int(y), int(bw), int(bh)],
                 "area": area,
                 "center": [int(x + bw // 2), int(y + bh // 2)]
             })
+            mask_by_layer_id[layer_id] = mask_info["mask"]
 
-            print(f"  Layer {idx}: {layer_filename} ({bw}x{bh}, area={area})", file=sys.stderr)
+            print(f"  Layer {layer_id}: {layer_filename} ({bw}x{bh}, area={area})", file=sys.stderr)
 
         # レイヤー分類
         classification = self.classify_layers(layers, (h, w, 3))
@@ -110,27 +111,21 @@ class SAMSegmenter:
         if bg_id is not None and fg_ids:
             print("Inpainting background with LaMa...", file=sys.stderr)
 
-            # 前景オブジェクトのマスクだけ合成（小要素は含めない）
-            fg_masks = []
-            for fid in fg_ids:
-                fm = exclusive_masks[fid]["mask"] if fid < len(exclusive_masks) else None
-                if fm is not None:
-                    fg_masks.append(fm)
+            fg_masks = [mask_by_layer_id[fid] for fid in fg_ids if fid in mask_by_layer_id]
 
             if fg_masks:
                 inpainted_bg = self.inpaint_background(image_rgb, fg_masks)
 
-                bg_layer = layers[bg_id] if bg_id < len(layers) else None
-                if bg_layer is not None:
-                    bg_path = output_path / bg_layer["filename"]
-                    cv2.imwrite(str(bg_path), inpainted_bg)
+                bg_layer = layers[bg_id]
+                bg_path = output_path / bg_layer["filename"]
+                cv2.imwrite(str(bg_path), inpainted_bg)
 
-                    bg_layer["bbox"] = [0, 0, w, h]
-                    bg_layer["area"] = w * h
-                    bg_layer["center"] = [w // 2, h // 2]
-                    bg_layer["inpainted"] = True
+                bg_layer["bbox"] = [0, 0, w, h]
+                bg_layer["area"] = w * h
+                bg_layer["center"] = [w // 2, h // 2]
+                bg_layer["inpainted"] = True
 
-                    print(f"  Background layer {bg_id} inpainted at full size ({w}x{h})", file=sys.stderr)
+                print(f"  Background layer {bg_id} inpainted at full size ({w}x{h})", file=sys.stderr)
 
         # メタデータ
         metadata = {
